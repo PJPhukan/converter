@@ -652,10 +652,14 @@ export default function LabHTMLGenerator() {
 
       {/* Header */}
       <div style={{ background: "linear-gradient(135deg,#0d1117 0%,#161b27 100%)", borderBottom: "1px solid #1e3a5f", padding: "18px 28px", display: "flex", alignItems: "center", gap: 16 }}>
-        <div style={{ width: 36, height: 36, borderRadius: 8, background: "linear-gradient(135deg,#00d2ff,#0066cc)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 900, color: "#fff", boxShadow: "0 0 20px rgba(0,210,255,0.3)" }}>⚗</div>
+        <img
+          src="/logo.png"
+          alt="Logo"
+          style={{ width: 36, height: 36, borderRadius: 8, objectFit: "cover", boxShadow: "0 0 20px rgba(0,210,255,0.3)" }}
+        />
         <div>
           <div style={{ fontWeight: 700, fontSize: 16, letterSpacing: "0.05em", color: "#00d2ff" }}>LAB HTML GENERATOR</div>
-          <div style={{ fontSize: 11, color: "#5a7a9a", letterSpacing: "0.08em" }}>FIRSTMEDIX · BATCH DOCX → HTML CONVERTER</div>
+          <div style={{ fontSize: 11, color: "#5a7a9a", letterSpacing: "0.08em" }}>BATCH DOCX → HTML CONVERTER</div>
         </div>
         {results.length > 0 && (
           <div style={{ marginLeft: "auto", display: "flex", gap: 10 }}>
