@@ -495,7 +495,6 @@ Test results are not valid for medico-legal purposes.
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function LabHTMLGenerator() {
-  const [files, setFiles] = useState([]);
   const [results, setResults] = useState([]);
   const [processing, setProcessing] = useState(false);
   const [activeIdx, setActiveIdx] = useState(null);
@@ -562,18 +561,17 @@ export default function LabHTMLGenerator() {
   const handleDrop = useCallback((e) => {
     e.preventDefault();
     const dropped = Array.from(e.dataTransfer.files).filter((f) => f.name.endsWith(".docx"));
-    if (dropped.length) { setFiles(dropped); processFiles(dropped); }
+    if (dropped.length) { processFiles(dropped); }
   }, [processFiles]);
 
   const handleFileInput = (e) => {
     const chosen = Array.from(e.target.files).filter((f) => f.name.endsWith(".docx"));
-    if (chosen.length) { setFiles(chosen); processFiles(chosen); }
+    if (chosen.length) { processFiles(chosen); }
   };
 
   const handleAddMoreFiles = (e) => {
     const chosen = Array.from(e.target.files).filter((f) => f.name.endsWith(".docx"));
     if (chosen.length) {
-      setFiles((prev) => [...prev, ...chosen]);
       processFiles(chosen, true);
     }
     e.target.value = "";
@@ -622,7 +620,6 @@ export default function LabHTMLGenerator() {
   const removeResult = (idxToRemove) => {
     setResults((prev) => {
       const next = prev.filter((_, idx) => idx !== idxToRemove);
-      setFiles((pf) => pf.filter((_, idx) => idx !== idxToRemove));
       setCopiedFileNameIdx((pi) => {
         if (pi === null) return pi;
         if (pi === idxToRemove) return null;
@@ -687,7 +684,7 @@ export default function LabHTMLGenerator() {
             <>
               <div style={{ padding: "10px 16px", fontSize: 11, color: "#4a6a8a", letterSpacing: "0.08em", borderBottom: "1px solid #1e2d3d", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                 <span>FILES ({results.length})</span>
-                <button onClick={() => { setResults([]); setActiveIdx(null); setFiles([]); }} style={{ background: "none", border: "none", color: "#4a6a8a", cursor: "pointer", fontSize: 16 }}>×</button>
+                <button onClick={() => { setResults([]); setActiveIdx(null); }} style={{ background: "none", border: "none", color: "#4a6a8a", cursor: "pointer", fontSize: 16 }}>×</button>
               </div>
               {results.map((r, i) => (
                 <div key={i} onClick={() => selectResult(i)}
