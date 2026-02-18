@@ -1,71 +1,55 @@
-# Getting Started with Create React App
+# Doc to HTML Converter
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+A local React app to convert lab `.docx` reports into HTML templates for quick copy/paste into your internal system.
 
-## Available Scripts
+## What It Does
 
-In the project directory, you can run:
+- Batch upload `.docx` files (drag/drop or file picker).
+- Extract key report fields from Word XML:
+- `Test Name`
+- `Method`
+- `Result`
+- `Units`
+- `Bio. Ref. Interval`
+- Build formatted HTML output per file.
+- Preview, edit, and copy generated HTML.
+- Copy file name without `.docx`.
+- Download all generated HTML as a single file.
 
-### `npm start`
+## Recent Behavior Fixes
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+- Reduced unwanted blank spacing in pasted output by tightening `<br>` usage and using margin-based spacing in generated blocks.
+- Fixed table alignment by rendering header and data in a single fixed-layout table with shared column widths.
+- Updated filename copy action to exclude `.docx` extension (case-insensitive).
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+## Tech Stack
 
-### `npm test`
+- React 19
+- `react-scripts` (Create React App)
+- `JSZip` loaded from CDN at runtime for parsing `.docx` archives
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+## Run Locally
 
-### `npm run build`
+```bash
+npm install
+npm start
+```
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+Open `http://localhost:3000`.
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+## Build
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+```bash
+npm run build
+```
 
-### `npm run eject`
+Production output is generated in `build/`.
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+## Main File
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+- `src/lab-html-generator.jsx`
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+## Notes
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
-
-## Learn More
-
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
-
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
-# converter
+- Processing is fully client-side in the browser.
+- No server upload is required for conversion logic in this app.
