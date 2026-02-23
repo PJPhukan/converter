@@ -498,7 +498,7 @@ export default function LabHTMLGenerator() {
   const [results, setResults] = useState([]);
   const [processing, setProcessing] = useState(false);
   const [activeIdx, setActiveIdx] = useState(null);
-  const [tab, setTab] = useState("html");
+  const [tab, setTab] = useState("preview");
   const [copiedIdx, setCopiedIdx] = useState(null);
   const [copiedFileNameIdx, setCopiedFileNameIdx] = useState(null);
   const [editedHTML, setEditedHTML] = useState("");
@@ -545,14 +545,14 @@ export default function LabHTMLGenerator() {
         const next = [...prev, ...processed];
         const newActiveIdx = prev.length;
         setActiveIdx(newActiveIdx);
-        setTab("html");
+        setTab("preview");
         if (processed[0]) setEditedHTML(processed[0].html);
         return next;
       });
     } else {
       setResults(processed);
       setActiveIdx(0);
-      setTab("html");
+      setTab("preview");
       if (processed[0]) setEditedHTML(processed[0].html);
     }
     setProcessing(false);
@@ -579,7 +579,7 @@ export default function LabHTMLGenerator() {
 
   const selectResult = (idx) => {
     setActiveIdx(idx);
-    setTab("html");
+    setTab("preview");
     setEditedHTML(results[idx].editedHTML);
   };
 
@@ -614,7 +614,7 @@ export default function LabHTMLGenerator() {
 
   const saveEdit = () => {
     setResults((prev) => prev.map((r, i) => i === activeIdx ? { ...r, editedHTML } : r));
-    setTab("html");
+    setTab("preview");
   };
 
   const removeResult = (idxToRemove) => {
