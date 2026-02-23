@@ -96,6 +96,7 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
     result: "",
     units: "",
     refInterval: "",
+    resultRows: [],
     sections: [],
   };
 
@@ -106,6 +107,74 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
   // If we got anything from the drawings, mark the result row as captured so
   // the paragraph loop doesn't overwrite with empty tab-split rows.
   let capturedResultRowFromDrawing = !!(data.units || data.refInterval || data.testName);
+
+  // ── Extract structured rows from actual Word tables (w:tbl) ────────────────
+  const getNodeText = (node) => {
+    let text = "";
+    const walker = doc.createTreeWalker(node, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let current = walker.currentNode;
+    while (current) {
+      if (current.nodeType === Node.TEXT_NODE) {
+        text += current.nodeValue || "";
+      } else if (current.nodeType === Node.ELEMENT_NODE) {
+        const local = (current.localName || "").toLowerCase();
+        if (local === "tab") text += "\t";
+        if (local === "br" || local === "cr" || local === "p") text += "\n";
+      }
+      current = walker.nextNode();
+    }
+    return text.replace(/\u00a0/g, " ").replace(/\s+\n/g, "\n").replace(/\n\s+/g, "\n").trim();
+  };
+
+  const parseTableRows = () => {
+    const tables = Array.from(doc.getElementsByTagNameNS(WORD_NS, "tbl"));
+    for (const tbl of tables) {
+      const rowNodes = Array.from(tbl.getElementsByTagNameNS(WORD_NS, "tr"));
+      if (!rowNodes.length) continue;
+
+      const rawRows = rowNodes.map((tr) => {
+        const cells = Array.from(tr.getElementsByTagNameNS(WORD_NS, "tc"));
+        return cells.map((tc) => getNodeText(tc).replace(/\s+/g, " ").trim());
+      });
+
+      // Candidate result table: rows with 4 cells and analyte-style first cell.
+      const candidateRows = rawRows
+        .filter((cells) => cells.length >= 4)
+        .map((cells) => ({
+          testName: cells[0] || "",
+          result: cells[1] || "",
+          units: cells[2] || "",
+          refInterval: cells[3] || "",
+        }))
+        .filter((r) =>
+          r.testName &&
+          !/^(test\s*name|results?|units?|bio\.?\s*ref\.?\s*interval)$/i.test(r.testName) &&
+          (r.units || r.refInterval || r.result)
+        );
+
+      if (!candidateRows.length) continue;
+
+      // Use first merged/header row to capture title + method if missing.
+      const mergedTitleRow = rawRows.find((cells) => cells.length === 1 && /[a-z]/i.test(cells[0] || ""));
+      if (mergedTitleRow && !data.testName) {
+        const lines = mergedTitleRow[0].split("\n").map((s) => s.trim()).filter(Boolean);
+        if (lines[0]) data.testName = lines[0];
+        if (!data.method) {
+          const m = lines.find((ln) => /^\([^)]+\)$/.test(ln));
+          if (m) data.method = m;
+        }
+      }
+
+      data.resultRows = candidateRows;
+      if (!data.result && candidateRows[0]?.result) data.result = candidateRows[0].result;
+      if (!data.units && candidateRows[0]?.units) data.units = candidateRows[0].units;
+      if (!data.refInterval && candidateRows[0]?.refInterval) data.refInterval = candidateRows[0].refInterval;
+      capturedResultRowFromDrawing = true;
+      break;
+    }
+  };
+
+  parseTableRows();
 
   // ── helpers ──────────────────────────────────────────────────────────────────
   const readValAttr = (node) => {
@@ -221,9 +290,14 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
     activeSectionIdx = data.sections.length - 1;
   };
 
-  const addItem = (text, listType, html) => {
+  const addItem = (text, listType, html, options = {}) => {
     if (activeSectionIdx < 0) return;
-    data.sections[activeSectionIdx].items.push({ text, listType, html: html || escapeHtml(text) });
+    data.sections[activeSectionIdx].items.push({
+      text,
+      listType,
+      html: html || escapeHtml(text),
+      preformatted: !!options.preformatted,
+    });
   };
 
   // ── state machine ─────────────────────────────────────────────────────────────
@@ -246,6 +320,17 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
       return false;
     })();
     if (isInsideTextbox) return;
+
+    // Table content is parsed via parseTableRows() to preserve row structure.
+    const isInsideTable = (() => {
+      let node = p.parentNode;
+      while (node && node.nodeType === 1) {
+        if ((node.localName || "").toLowerCase() === "tbl") return true;
+        node = node.parentNode;
+      }
+      return false;
+    })();
+    if (isInsideTable) return;
 
     // Skip paragraphs that contain a drawing/inline — their text comes from
     // getParagraphText() crawling INTO the nested textboxes, which duplicates
@@ -306,7 +391,15 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
       // This prevents duplicated "simple text" output under the table.
       if (!inSection) return;
 
-      // Tab text inside a section → treat as plain text
+      // Tab text inside a section:
+      // keep ASCII/pipe tables preformatted; otherwise flatten as plain text.
+      const rawTabbedText = text;
+      const looksLikeAsciiTable = /\|/.test(rawTabbedText) || /-{3,}/.test(rawTabbedText);
+      if (looksLikeAsciiTable) {
+        const preText = rawTabbedText.replace(/\t/g, "    ").replace(/\u00a0/g, " ");
+        addItem(preText, "", escapeHtml(preText), { preformatted: true });
+        return;
+      }
       text = parts.join(" ").replace(/\s+/g, " ").trim();
       richHtml = escapeHtml(text);
       if (!text) return;
@@ -363,6 +456,19 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
     // Named section keyword
     const isSectionKeyword = SECTION_HEADING_RE.test(text);
 
+    // Inline heading with content in the same paragraph, e.g.:
+    // "Note: ...", "Comment: ..."
+    const inlineHeadingMatch = text.match(/^(note|comment|comments)\s*:\s*(.+)$/i);
+    if (capturedResultRow && inlineHeadingMatch) {
+      const sectionTitleRaw = inlineHeadingMatch[1].toLowerCase();
+      const sectionTitle = sectionTitleRaw === "comments" ? "Comments" : `${sectionTitleRaw[0].toUpperCase()}${sectionTitleRaw.slice(1)}`;
+      startSection(sectionTitle);
+      inSection = true;
+      const body = inlineHeadingMatch[2].trim();
+      if (body) addItem(body, "", escapeHtml(body));
+      return;
+    }
+
     if (capturedResultRow && (isSectionKeyword || isHeadingStyle || isEntirelyBold)) {
       // Start a new section
       const sectionTitle = text.replace(/:?\s*$/, "").trim();
@@ -415,6 +521,11 @@ function generateHTML(data) {
     items.forEach((item, idx) => {
       const itemHtml = item.html || esc(item.text || "");
       if (!itemHtml) return;
+      if (item.preformatted) {
+        flushList();
+        html += `<pre style="margin:4px 0;white-space:pre-wrap;font-family:'IBM Plex Mono','Courier New',monospace;font-size:12px;line-height:1.5;">${itemHtml}</pre>`;
+        return;
+      }
       if (item.listType === "bullet" || item.listType === "number") {
         if (!listType) listType = item.listType;
         if (listType !== item.listType) flushList();
@@ -446,7 +557,35 @@ ${itemsHtml}
     })
     .join("");
 
+  const tableRows = (data.resultRows && data.resultRows.length)
+    ? data.resultRows
+    : [{
+        testName: data.testName || "",
+        result: data.result || "",
+        units: data.units || "",
+        refInterval: data.refInterval || "",
+      }];
+
+  const titleBlock = (data.resultRows && data.resultRows.length && (data.testName || data.method))
+    ? `<div style="margin:0 0 8px 0;">
+<div style="font-weight:700;text-decoration:underline;">${esc(data.testName)}</div>
+${data.method ? `<div style="margin-top:4px;font-weight:600;">${esc(data.method)}</div>` : ""}
+</div>`
+    : "";
+
+  const rowsHtml = tableRows
+    .map((row) => `<tr>
+<td style="border:1px solid #000;padding:6px;vertical-align:top;">
+${esc(row.testName)}
+</td>
+<td style="border:1px solid #000;padding:6px;color:#000;vertical-align:top;">${esc(row.result)}</td>
+<td style="border:1px solid #000;padding:6px;vertical-align:top;">${esc(row.units)}</td>
+<td style="border:1px solid #000;padding:6px;color:#000;vertical-align:top;">${esc(row.refInterval)}</td>
+</tr>`)
+    .join("");
+
   return `<!-- ================= RESULT TABLE ================= -->
+${titleBlock}
 <table style="width:100%;border-collapse:collapse;table-layout:fixed;margin-bottom:10px;">
 <colgroup>
 <col style="width:40%;">
@@ -463,15 +602,7 @@ ${itemsHtml}
 </tr>
 </thead>
 <tbody>
-<tr>
-<td style="border:1px solid #000;padding:6px;vertical-align:top;">
-<div style="font-weight:700;text-decoration:underline;">${esc(data.testName)}</div>
-${data.method ? `<div style="margin-top:6px;font-weight:600;">${esc(data.method)}</div>` : ""}
-</td>
-<td style="border:1px solid #000;padding:6px;color:#000;vertical-align:top;">${esc(data.result)}</td>
-<td style="border:1px solid #000;padding:6px;vertical-align:top;">${esc(data.units)}</td>
-<td style="border:1px solid #000;padding:6px;color:#000;vertical-align:top;">${esc(data.refInterval)}</td>
-</tr>
+${rowsHtml}
 </tbody>
 </table>
 
@@ -643,7 +774,7 @@ export default function LabHTMLGenerator() {
     : "";
 
   return (
-    <div style={{ fontFamily: "'IBM Plex Mono','Courier New',monospace", background: "#0a0a0f", minHeight: "100vh", color: "#e8e8f0", display: "flex", flexDirection: "column" }}>
+    <div style={{ fontFamily: "'IBM Plex Mono','Courier New',monospace", background: "#0a0a0f", height: "100vh", color: "#e8e8f0", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       {toastMessage && (
         <div style={{ position: "fixed", top: 12, left: "50%", transform: "translateX(-50%)", background: "#0f2436", border: "1px solid #00d2ff", color: "#b8e8ff", padding: "8px 14px", borderRadius: 8, fontSize: 11, letterSpacing: "0.05em", zIndex: 2000, animation: "toastSlide 0.2s ease-out" }}>
           {toastMessage}
@@ -669,9 +800,9 @@ export default function LabHTMLGenerator() {
         )}
       </div>
 
-      <div style={{ display: "flex", flex: 1, overflow: "hidden", height: "calc(100vh - 73px)" }}>
+      <div style={{ display: "flex", flex: 1, overflow: "hidden", minHeight: 0 }}>
         {/* Sidebar */}
-        <div style={{ width: 240, background: "#0d1117", borderRight: "1px solid #1e2d3d", overflowY: "auto", flexShrink: 0 }}>
+        <div style={{ width: 240, background: "#0d1117", borderRight: "1px solid #1e2d3d", flexShrink: 0, display: "flex", flexDirection: "column", minHeight: 0 }}>
           {results.length === 0 ? (
             <div
               onDrop={handleDrop} onDragOver={(e) => e.preventDefault()}
@@ -690,27 +821,29 @@ export default function LabHTMLGenerator() {
                 <span>FILES ({results.length})</span>
                 <button onClick={() => { setResults([]); setActiveIdx(null); }} style={{ background: "none", border: "none", color: "#4a6a8a", cursor: "pointer", fontSize: 16 }}>×</button>
               </div>
-              {results.map((r, i) => (
-                <div key={i} onClick={() => selectResult(i)}
-                  style={{ padding: "10px 14px", borderBottom: "1px solid #111827", cursor: "pointer", background: activeIdx === i ? "rgba(0,210,255,0.08)" : "transparent", borderLeft: activeIdx === i ? "3px solid #00d2ff" : "3px solid transparent", transition: "all 0.15s", display: "flex", alignItems: "flex-start", gap: 8 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 11, color: r.status === "error" ? "#ff4444" : "#c0d8f0", wordBreak: "break-word", lineHeight: 1.4 }}>
-                      {r.status === "error" ? "⚠ " : "✓ "}{getBaseFileName(r.fileName)}
+              <div style={{ flex: 1, overflowY: "auto", minHeight: 0 }}>
+                {results.map((r, i) => (
+                  <div key={i} onClick={() => selectResult(i)}
+                    style={{ padding: "10px 14px", borderBottom: "1px solid #111827", cursor: "pointer", background: activeIdx === i ? "rgba(0,210,255,0.08)" : "transparent", borderLeft: activeIdx === i ? "3px solid #00d2ff" : "3px solid transparent", transition: "all 0.15s", display: "flex", alignItems: "flex-start", gap: 8 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 11, color: r.status === "error" ? "#ff4444" : "#c0d8f0", wordBreak: "break-word", lineHeight: 1.4 }}>
+                        {r.status === "error" ? "⚠ " : "✓ "}{getBaseFileName(r.fileName)}
+                      </div>
+                      {r.parsed?.testName && (
+                        <div style={{ fontSize: 10, color: "#3a6a8a", marginTop: 3 }}>{r.parsed.testName.substring(0, 30)}</div>
+                      )}
                     </div>
-                    {r.parsed?.testName && (
-                      <div style={{ fontSize: 10, color: "#3a6a8a", marginTop: 3 }}>{r.parsed.testName.substring(0, 30)}</div>
-                    )}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <button onClick={(e) => { e.stopPropagation(); copyFileName(i); }} title={copiedFileNameIdx === i ? "Copied" : "Copy file name"}
+                        style={{ background: "none", border: "none", color: copiedFileNameIdx === i ? "#00d2ff" : "#4a6a8a", cursor: "pointer", fontSize: 12, lineHeight: 1, padding: "0 2px" }}>
+                        {copiedFileNameIdx === i ? "✓" : "⧉"}
+                      </button>
+                      <button onClick={(e) => { e.stopPropagation(); removeResult(i); }} title="Remove file"
+                        style={{ background: "none", border: "none", color: "#4a6a8a", cursor: "pointer", fontSize: 14, lineHeight: 1, padding: "0 2px" }}>×</button>
+                    </div>
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <button onClick={(e) => { e.stopPropagation(); copyFileName(i); }} title={copiedFileNameIdx === i ? "Copied" : "Copy file name"}
-                      style={{ background: "none", border: "none", color: copiedFileNameIdx === i ? "#00d2ff" : "#4a6a8a", cursor: "pointer", fontSize: 12, lineHeight: 1, padding: "0 2px" }}>
-                      {copiedFileNameIdx === i ? "✓" : "⧉"}
-                    </button>
-                    <button onClick={(e) => { e.stopPropagation(); removeResult(i); }} title="Remove file"
-                      style={{ background: "none", border: "none", color: "#4a6a8a", cursor: "pointer", fontSize: 14, lineHeight: 1, padding: "0 2px" }}>×</button>
-                  </div>
-                </div>
-              ))}
+                ))}
+              </div>
               <div onClick={() => addMoreFileInputRef.current.click()}
                 style={{ padding: "12px 14px", cursor: "pointer", color: "#3a6a8a", fontSize: 11, textAlign: "center", borderTop: "1px solid #1e2d3d" }}>
                 + Add more files
@@ -726,7 +859,7 @@ export default function LabHTMLGenerator() {
         </div>
 
         {/* Main panel */}
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
           {active ? (
             <>
               <div style={{ display: "flex", alignItems: "center", gap: 2, padding: "8px 16px", background: "#0d1117", borderBottom: "1px solid #1e2d3d" }}>
@@ -748,16 +881,16 @@ export default function LabHTMLGenerator() {
                 </div>
               </div>
 
-              <div style={{ flex: 1, overflow: "auto" }}>
+              <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
                 {tab === "html" && (
                   <pre style={{ margin: 0, padding: "20px 24px", fontSize: 12, lineHeight: 1.7, color: "#a8c8e8", whiteSpace: "pre-wrap", wordBreak: "break-word", background: "#080c10" }}>
                     <code>{displayHTML}</code>
                   </pre>
                 )}
                 {tab === "preview" && (
-                  <div style={{ padding: 24, background: "#fff" }}>
+                  <div style={{ padding: 24, background: "#fff", boxSizing: "border-box", height: "100%" }}>
                     <iframe srcDoc={`<html><body style="font-family:Arial,sans-serif;font-size:13px;padding:20px;">${displayHTML}</body></html>`}
-                      style={{ width: "100%", height: "calc(100vh - 150px)", border: "none" }} title="Preview" />
+                      style={{ width: "100%", height: "100%", border: "none" }} title="Preview" />
                   </div>
                 )}
                 {tab === "edit" && (
