@@ -28,10 +28,13 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
 
   
   function fillFromDrawings(data) {
-    const inlines = doc.getElementsByTagNameNS(WP_NS, "inline");
-    for (const inline of Array.from(inlines)) {
+    const drawings = [
+      ...Array.from(doc.getElementsByTagNameNS(WP_NS, "inline")),
+      ...Array.from(doc.getElementsByTagNameNS(WP_NS, "anchor")),
+    ];
+    for (const drawing of drawings) {
       // Determine total group width so we can compute column ratios
-      const grpSpPrs = inline.getElementsByTagNameNS(WPG_NS, "grpSpPr");
+      const grpSpPrs = drawing.getElementsByTagNameNS(WPG_NS, "grpSpPr");
       let groupCx = 0;
       if (grpSpPrs.length) {
         const extNode = grpSpPrs[0].getElementsByTagNameNS(DML_NS, "ext")[0];
@@ -41,7 +44,7 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
 
       // Collect all textbox shapes with their x offset and text content
       const boxes = [];
-      Array.from(inline.getElementsByTagNameNS(WPS_NS, "wsp")).forEach((wsp) => {
+      Array.from(drawing.getElementsByTagNameNS(WPS_NS, "wsp")).forEach((wsp) => {
         const spPr = wsp.getElementsByTagNameNS(WPS_NS, "spPr")[0];
         if (!spPr) return;
         const xfrmList = spPr.getElementsByTagNameNS(DML_NS, "xfrm");
@@ -96,6 +99,7 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
     result: "",
     units: "",
     refInterval: "",
+    resultRows: [],
     sections: [],
   };
 
@@ -126,6 +130,93 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
       .replace(/^(?:\s*<br>\s*)+/i, "")
       .replace(/(?:\s*<br>\s*)+$/i, "")
       .trim();
+
+  // Extract text content from any node preserving tab/newline hints.
+  const getNodeText = (node) => {
+    let text = "";
+    const walk = (n) => {
+      if (!n) return;
+      if (n.nodeType === Node.TEXT_NODE) {
+        text += n.nodeValue || "";
+        return;
+      }
+      if (n.nodeType !== Node.ELEMENT_NODE) return;
+      const local = (n.localName || "").toLowerCase();
+      if (local === "tab") text += "\t";
+      if (local === "br" || local === "cr") text += "\n";
+      if (local === "p" && text && !text.endsWith("\n")) text += "\n";
+      Array.from(n.childNodes).forEach(walk);
+    };
+    walk(node);
+    return text.replace(/\u00a0/g, " ").replace(/\s+\n/g, "\n").replace(/\n\s+/g, "\n").trim();
+  };
+
+  // Parse true Word tables (<w:tbl>) into structured result rows.
+  const parseTableRows = () => {
+    const tables = Array.from(doc.getElementsByTagNameNS(WORD_NS, "tbl"));
+    for (const tbl of tables) {
+      const rowNodes = Array.from(tbl.getElementsByTagNameNS(WORD_NS, "tr"));
+      if (!rowNodes.length) continue;
+
+      const rawRows = rowNodes.map((tr) => {
+        const cells = Array.from(tr.getElementsByTagNameNS(WORD_NS, "tc"));
+        return cells.map((tc) => getNodeText(tc).replace(/\s+/g, " ").trim());
+      });
+
+      const rows = rawRows
+        .filter((cells) => cells.length >= 4)
+        .map((cells) => ({
+          testName: cells[0] || "",
+          result: cells[1] || "",
+          units: cells[2] || "",
+          refInterval: cells[3] || "",
+        }))
+        .filter((r) =>
+          r.testName &&
+          !/^(test\s*name|results?|units?|bio\.?\s*ref\.?\s*interval)$/i.test(r.testName) &&
+          (r.result || r.units || r.refInterval)
+        );
+
+      if (!rows.length) continue;
+
+      const titleRow = rawRows.find((cells) => cells.length === 1 && /[a-z]/i.test(cells[0] || ""));
+      if (titleRow && !data.testName) {
+        const lines = titleRow[0].split("\n").map((s) => s.trim()).filter(Boolean);
+        if (lines[0]) data.testName = lines[0];
+        if (!data.method) {
+          const methodLine = lines.find((ln) => /^\([^)]+\)$/.test(ln));
+          if (methodLine) data.method = methodLine;
+        }
+      }
+
+      // Fallbacks when merged title row isn't present/clean.
+      if (!data.testName) {
+        const headerLike = rawRows
+          .flat()
+          .map((v) => (v || "").trim())
+          .find((v) =>
+            v &&
+            !/^(test\s*name|results?|units?|bio\.?\s*ref\.?\s*interval)$/i.test(v) &&
+            /[a-z]/i.test(v) &&
+            (/,|serum|plasma|urine|electrophoresis|assay|profile|panel/i.test(v))
+          );
+        if (headerLike) data.testName = headerLike;
+      }
+
+      data.resultRows = rows;
+      if (!data.result && rows[0]?.result) data.result = rows[0].result;
+      if (!data.units && rows[0]?.units) data.units = rows[0].units;
+      if (!data.refInterval && rows[0]?.refInterval) data.refInterval = rows[0].refInterval;
+      if (!data.testName) {
+        const firstNamedRow = rows.find((r) => r.testName && /[a-z]/i.test(r.testName));
+        if (firstNamedRow) data.testName = firstNamedRow.testName;
+      }
+      capturedResultRowFromDrawing = true;
+      break;
+    }
+  };
+
+  parseTableRows();
 
   // ── numbering map (for list type detection) ──────────────────────────────────
   const numberingMap = (() => {
@@ -221,14 +312,20 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
     activeSectionIdx = data.sections.length - 1;
   };
 
-  const addItem = (text, listType, html) => {
+  const addItem = (text, listType, html, options = {}) => {
     if (activeSectionIdx < 0) return;
-    data.sections[activeSectionIdx].items.push({ text, listType, html: html || escapeHtml(text) });
+    data.sections[activeSectionIdx].items.push({
+      text,
+      listType,
+      html: html || escapeHtml(text),
+      preformatted: !!options.preformatted,
+    });
   };
 
   // ── state machine ─────────────────────────────────────────────────────────────
   let capturedResultRow = capturedResultRowFromDrawing;
   let inSection = false; // are we currently collecting items for a section?
+  let hasAdditionalNotesSection = false;
 
   // Headings that start new bold sections within the body
   const SECTION_HEADING_RE = /^(note|intended\s*use|clinical\s*use|comments|decreased\s*levels?|increased\s*levels?|reference\s*range|interpretation|methodology|principle|specimen|limitations?|interference|background|clinical\s*significance)s*:?\s*$/i;
@@ -246,6 +343,16 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
       return false;
     })();
     if (isInsideTextbox) return;
+
+    const isInsideTable = (() => {
+      let node = p.parentNode;
+      while (node && node.nodeType === 1) {
+        if ((node.localName || "").toLowerCase() === "tbl") return true;
+        node = node.parentNode;
+      }
+      return false;
+    })();
+    if (isInsideTable) return;
 
     // Skip paragraphs that contain a drawing/inline — their text comes from
     // getParagraphText() crawling INTO the nested textboxes, which duplicates
@@ -306,7 +413,14 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
       // This prevents duplicated "simple text" output under the table.
       if (!inSection) return;
 
-      // Tab text inside a section → treat as plain text
+      // Keep pipe/ascii table-like rows preformatted, otherwise flatten.
+      const rawTabbedText = text;
+      const looksLikeAsciiTable = /\|/.test(rawTabbedText) || /-{3,}/.test(rawTabbedText);
+      if (looksLikeAsciiTable) {
+        const preText = rawTabbedText.replace(/\t/g, "    ").replace(/\u00a0/g, " ");
+        addItem(preText, "", escapeHtml(preText), { preformatted: true });
+        return;
+      }
       text = parts.join(" ").replace(/\s+/g, " ").trim();
       richHtml = escapeHtml(text);
       if (!text) return;
@@ -363,6 +477,17 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
     // Named section keyword
     const isSectionKeyword = SECTION_HEADING_RE.test(text);
 
+    const inlineHeadingMatch = text.match(/^(note|comment|comments)\s*:\s*(.+)$/i);
+    if (capturedResultRow && inlineHeadingMatch) {
+      const sectionTitleRaw = inlineHeadingMatch[1].toLowerCase();
+      const sectionTitle = sectionTitleRaw === "comments" ? "Comments" : `${sectionTitleRaw[0].toUpperCase()}${sectionTitleRaw.slice(1)}`;
+      startSection(sectionTitle);
+      inSection = true;
+      const body = inlineHeadingMatch[2].trim();
+      if (body) addItem(body, "", escapeHtml(body));
+      return;
+    }
+
     if (capturedResultRow && (isSectionKeyword || isHeadingStyle || isEntirelyBold)) {
       // Start a new section
       const sectionTitle = text.replace(/:?\s*$/, "").trim();
@@ -374,6 +499,21 @@ function parseDocxXml(xmlString, numberingXmlString = "") {
     // ── Collect items into active section ─────────────────────────────────────
     if (inSection) {
       addItem(text, listType, richHtml);
+      return;
+    }
+
+    // Fallback: keep meaningful uncategorized lines after result table.
+    if (capturedResultRow) {
+      const isNoise = /^(page\s+\d+\s+of\s+\d+|[-\s]*end\s+of\s+report[-\s]*|important\s*instructions?)$/i.test(text);
+      const hasLetters = /[a-z]/i.test(text);
+      if (!isNoise && hasLetters && text.length > 3) {
+        if (!hasAdditionalNotesSection) {
+          startSection("Additional Notes");
+          inSection = true;
+          hasAdditionalNotesSection = true;
+        }
+        addItem(text, listType, richHtml);
+      }
       return;
     }
 
@@ -415,6 +555,11 @@ function generateHTML(data) {
     items.forEach((item, idx) => {
       const itemHtml = item.html || esc(item.text || "");
       if (!itemHtml) return;
+      if (item.preformatted) {
+        flushList();
+        html += `<pre style="margin:4px 0;white-space:pre-wrap;font-family:'IBM Plex Mono','Courier New',monospace;font-size:12px;line-height:1.5;">${itemHtml}</pre>`;
+        return;
+      }
       if (item.listType === "bullet" || item.listType === "number") {
         if (!listType) listType = item.listType;
         if (listType !== item.listType) flushList();
@@ -446,7 +591,42 @@ ${itemsHtml}
     })
     .join("");
 
+  const tableRows = (data.resultRows && data.resultRows.length)
+    ? data.resultRows
+    : (() => {
+        const fallbackName = data.testName || "";
+        const fallbackNameHtml = data.method
+          ? `${esc(fallbackName)}<br>${esc(data.method)}`
+          : esc(fallbackName);
+        return [{
+          testName: fallbackName,
+          testNameHtml: fallbackNameHtml,
+          result: data.result || "",
+          units: data.units || "",
+          refInterval: data.refInterval || "",
+        }];
+      })();
+
+  const derivedTestName = data.testName || tableRows.find((r) => r.testName)?.testName || "";
+
+  const titleBlock = (data.resultRows && data.resultRows.length && (derivedTestName || data.method))
+    ? `<div style="margin:0 0 8px 0;">
+<div style="font-weight:700;text-decoration:underline;">${esc(derivedTestName)}</div>
+${data.method ? `<div style="margin-top:4px;font-weight:600;">${esc(data.method)}</div>` : ""}
+</div>`
+    : "";
+
+  const rowsHtml = tableRows
+    .map((row) => `<tr>
+<td style="border:1px solid #000;padding:6px;vertical-align:top;">${row.testNameHtml || esc(row.testName)}</td>
+<td style="border:1px solid #000;padding:6px;color:#000;vertical-align:top;">${esc(row.result)}</td>
+<td style="border:1px solid #000;padding:6px;vertical-align:top;">${esc(row.units)}</td>
+<td style="border:1px solid #000;padding:6px;color:#000;vertical-align:top;">${esc(row.refInterval)}</td>
+</tr>`)
+    .join("");
+
   return `<!-- ================= RESULT TABLE ================= -->
+${titleBlock}
 <table style="width:100%;border-collapse:collapse;table-layout:fixed;margin-bottom:10px;">
 <colgroup>
 <col style="width:40%;">
@@ -463,15 +643,7 @@ ${itemsHtml}
 </tr>
 </thead>
 <tbody>
-<tr>
-<td style="border:1px solid #000;padding:6px;vertical-align:top;">
-<div style="font-weight:700;text-decoration:underline;">${esc(data.testName)}</div>
-${data.method ? `<div style="margin-top:6px;font-weight:600;">${esc(data.method)}</div>` : ""}
-</td>
-<td style="border:1px solid #000;padding:6px;color:#000;vertical-align:top;">${esc(data.result)}</td>
-<td style="border:1px solid #000;padding:6px;vertical-align:top;">${esc(data.units)}</td>
-<td style="border:1px solid #000;padding:6px;color:#000;vertical-align:top;">${esc(data.refInterval)}</td>
-</tr>
+${rowsHtml}
 </tbody>
 </table>
 
@@ -499,12 +671,15 @@ export default function LabHTMLGenerator() {
   const [processing, setProcessing] = useState(false);
   const [activeIdx, setActiveIdx] = useState(null);
   const [tab, setTab] = useState("preview");
+  const [previewSplit, setPreviewSplit] = useState(true);
+  const [editSplit, setEditSplit] = useState(true);
   const [copiedIdx, setCopiedIdx] = useState(null);
   const [copiedFileNameIdx, setCopiedFileNameIdx] = useState(null);
   const [editedHTML, setEditedHTML] = useState("");
   const [toastMessage, setToastMessage] = useState("");
   const fileInputRef = useRef();
   const addMoreFileInputRef = useRef();
+  const folderInputRef = useRef();
   const toastTimerRef = useRef(null);
 
   const showToast = useCallback((message) => {
@@ -517,7 +692,10 @@ export default function LabHTMLGenerator() {
     return () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); };
   }, []);
 
-  const getBaseFileName = useCallback((fileName = "") => fileName.replace(/\.docx$/i, ""), []);
+  const getBaseFileName = useCallback((fileName = "") => {
+    const base = (fileName || "").split(/[\\/]/).pop() || fileName;
+    return base.replace(/\.docx$/i, "");
+  }, []);
 
   const processFiles = useCallback(async (fileList, append = false) => {
     setProcessing(true);
@@ -534,9 +712,11 @@ export default function LabHTMLGenerator() {
         const numberingXml = numberingFile ? await numberingFile.async("string") : "";
         const parsed = parseDocxXml(docXml, numberingXml);
         const html = generateHTML(parsed);
-        processed.push({ fileName: file.name, parsed, html, status: "ok", editedHTML: html });
+        const displayName = file.webkitRelativePath || file.name;
+        processed.push({ fileName: displayName, parsed, html, status: "ok", editedHTML: html });
       } catch (err) {
-        processed.push({ fileName: file.name, parsed: {}, html: "", status: "error", error: err.message, editedHTML: "" });
+        const displayName = file.webkitRelativePath || file.name;
+        processed.push({ fileName: displayName, parsed: {}, html: "", status: "error", error: err.message, editedHTML: "" });
       }
     }
 
@@ -567,9 +747,18 @@ export default function LabHTMLGenerator() {
   const handleFileInput = (e) => {
     const chosen = Array.from(e.target.files).filter((f) => f.name.endsWith(".docx"));
     if (chosen.length) { processFiles(chosen); }
+    e.target.value = "";
   };
 
   const handleAddMoreFiles = (e) => {
+    const chosen = Array.from(e.target.files).filter((f) => f.name.endsWith(".docx"));
+    if (chosen.length) {
+      processFiles(chosen, true);
+    }
+    e.target.value = "";
+  };
+
+  const handleFolderInput = (e) => {
     const chosen = Array.from(e.target.files).filter((f) => f.name.endsWith(".docx"));
     if (chosen.length) {
       processFiles(chosen, true);
@@ -612,6 +801,18 @@ export default function LabHTMLGenerator() {
     URL.revokeObjectURL(url);
   };
 
+  const downloadOne = (idx) => {
+    const item = results[idx];
+    if (!item) return;
+    const html = item.editedHTML || item.html || "";
+    const fileBase = getBaseFileName(item.fileName || "lab_template");
+    const blob = new Blob([html], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `${fileBase || "lab_template"}.html`; a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const saveEdit = () => {
     setResults((prev) => prev.map((r, i) => i === activeIdx ? { ...r, editedHTML } : r));
     setTab("preview");
@@ -641,6 +842,7 @@ export default function LabHTMLGenerator() {
   const displayHTML = active
     ? tab === "edit" ? editedHTML : (active.editedHTML || active.html)
     : "";
+  const originalHTML = active ? active.html : "";
 
   return (
     <div style={{ fontFamily: "'IBM Plex Mono','Courier New',monospace", background: "#0a0a0f", minHeight: "100vh", color: "#e8e8f0", display: "flex", flexDirection: "column" }}>
@@ -716,6 +918,11 @@ export default function LabHTMLGenerator() {
                 + Add more files
               </div>
               <input ref={addMoreFileInputRef} type="file" accept=".docx" multiple style={{ display: "none" }} onChange={handleAddMoreFiles} />
+              <div onClick={() => folderInputRef.current.click()}
+                style={{ padding: "10px 14px", cursor: "pointer", color: "#2f5572", fontSize: 11, textAlign: "center", borderTop: "1px solid #101826" }}>
+                + Add folder
+              </div>
+              <input ref={folderInputRef} type="file" multiple webkitdirectory="" directory="" style={{ display: "none" }} onChange={handleFolderInput} />
             </>
           )}
           {processing && (
@@ -737,6 +944,16 @@ export default function LabHTMLGenerator() {
                   </button>
                 ))}
                 <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+                  {tab === "preview" && (
+                    <button onClick={() => setPreviewSplit((v) => !v)} style={btnStyle("#17202b", "#4aa3ff", 11)}>
+                      {previewSplit ? "Hide Code" : "Split View"}
+                    </button>
+                  )}
+                  {tab === "edit" && (
+                    <button onClick={() => setEditSplit((v) => !v)} style={btnStyle("#17202b", "#4aa3ff", 11)}>
+                      {editSplit ? "Hide Preview" : "Split View"}
+                    </button>
+                  )}
                   <span style={{ fontSize: 11, color: "#3a5a7a" }}>{active.fileName}</span>
                   {tab === "edit" ? (
                     <button onClick={saveEdit} style={btnStyle("#162a1a", "#00ff88", 11)}>💾 Save</button>
@@ -745,24 +962,53 @@ export default function LabHTMLGenerator() {
                       {copiedIdx === activeIdx ? "✓ Copied!" : "📋 Copy HTML"}
                     </button>
                   )}
+                  <button onClick={() => downloadOne(activeIdx)} style={btnStyle("#1d1d2a", "#b28bff", 11)}>⬇ Download</button>
                 </div>
               </div>
 
-              <div style={{ flex: 1, overflow: "auto" }}>
+              <div style={{ flex: 1, overflow: "hidden" }}>
                 {tab === "html" && (
-                  <pre style={{ margin: 0, padding: "20px 24px", fontSize: 12, lineHeight: 1.7, color: "#a8c8e8", whiteSpace: "pre-wrap", wordBreak: "break-word", background: "#080c10" }}>
-                    <code>{displayHTML}</code>
-                  </pre>
+                  <div style={{ height: "100%", overflow: "auto", background: "#080c10" }}>
+                    <pre style={{ margin: 0, padding: "20px 24px", fontSize: 12, lineHeight: 1.7, color: "#a8c8e8", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                      <code>{displayHTML}</code>
+                    </pre>
+                  </div>
                 )}
                 {tab === "preview" && (
-                  <div style={{ padding: 24, background: "#fff" }}>
-                    <iframe srcDoc={`<html><body style="font-family:Arial,sans-serif;font-size:13px;padding:20px;">${displayHTML}</body></html>`}
-                      style={{ width: "100%", height: "calc(100vh - 150px)", border: "none" }} title="Preview" />
+                  <div style={{ height: "100%", padding: 16, background: "#0b0f14" }}>
+                    <div style={{ display: "flex", gap: 16, height: "100%" }}>
+                      {previewSplit && (
+                        <div style={{ flex: 1, minWidth: 0, background: "#080c10", border: "1px solid #1e2d3d", borderRadius: 8, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+                          <div style={{ padding: "8px 12px", fontSize: 10, color: "#4a6a8a", borderBottom: "1px solid #1e2d3d", letterSpacing: "0.08em" }}>ORIGINAL HTML</div>
+                          <div style={{ flex: 1, overflow: "auto" }}>
+                            <pre style={{ margin: 0, padding: "12px 14px", fontSize: 12, lineHeight: 1.7, color: "#a8c8e8", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                              <code>{originalHTML}</code>
+                            </pre>
+                          </div>
+                        </div>
+                      )}
+                      <div style={{ flex: 1, minWidth: 0, background: "#ffffff", border: "1px solid #d9d9d9", borderRadius: 8, overflow: "hidden" }}>
+                        <iframe srcDoc={`<html><body style="font-family:Arial,sans-serif;font-size:13px;padding:20px;">${displayHTML}</body></html>`}
+                          style={{ width: "100%", height: "100%", border: "none" }} title="Preview" />
+                      </div>
+                    </div>
                   </div>
                 )}
                 {tab === "edit" && (
-                  <textarea value={editedHTML} onChange={(e) => setEditedHTML(e.target.value)}
-                    style={{ width: "100%", height: "100%", background: "#080c10", color: "#a8c8e8", border: "none", padding: "20px 24px", fontSize: 12, lineHeight: 1.7, fontFamily: "'IBM Plex Mono',monospace", resize: "none", outline: "none", boxSizing: "border-box" }} />
+                  <div style={{ height: "100%", padding: 16, background: "#0b0f14" }}>
+                    <div style={{ display: "flex", gap: 16, height: "100%" }}>
+                      <div style={{ flex: 1, minWidth: 0, background: "#080c10", border: "1px solid #1e2d3d", borderRadius: 8, overflow: "hidden" }}>
+                        <textarea value={editedHTML} onChange={(e) => setEditedHTML(e.target.value)}
+                          style={{ width: "100%", height: "100%", background: "#080c10", color: "#a8c8e8", border: "none", padding: "16px 18px", fontSize: 12, lineHeight: 1.7, fontFamily: "'IBM Plex Mono',monospace", resize: "none", outline: "none", boxSizing: "border-box" }} />
+                      </div>
+                      {editSplit && (
+                        <div style={{ flex: 1, minWidth: 0, background: "#ffffff", border: "1px solid #d9d9d9", borderRadius: 8, overflow: "hidden" }}>
+                          <iframe srcDoc={`<html><body style="font-family:Arial,sans-serif;font-size:13px;padding:20px;">${editedHTML}</body></html>`}
+                            style={{ width: "100%", height: "100%", border: "none" }} title="Edited Preview" />
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 )}
               </div>
 
@@ -789,6 +1035,11 @@ export default function LabHTMLGenerator() {
                 <div style={{ fontSize: 13, color: "#2a4a6a", lineHeight: 1.6 }}>Upload all 700 files at once<br />HTML will be generated instantly for each one</div>
               </div>
               <input ref={fileInputRef} type="file" accept=".docx" multiple style={{ display: "none" }} onChange={handleFileInput} />
+              <div onClick={() => folderInputRef.current?.click()}
+                style={{ fontSize: 11, color: "#3a6a9a", letterSpacing: "0.06em", cursor: "pointer", border: "1px solid #1e3a5f", padding: "6px 12px", borderRadius: 8, background: "rgba(0,210,255,0.02)" }}>
+                Upload a folder instead
+              </div>
+              <input ref={folderInputRef} type="file" multiple webkitdirectory="" directory="" style={{ display: "none" }} onChange={handleFolderInput} />
               <div style={{ fontSize: 11, color: "#1e3a5f", letterSpacing: "0.06em" }}>SUPPORTS BATCH UPLOAD · NO SERVER NEEDED · 100% LOCAL</div>
             </div>
           )}
